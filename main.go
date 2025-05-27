@@ -17,9 +17,13 @@ import (
 	"text/template"
 
 	"github.com/BurntSushi/toml"
-	"github.com/google/shlex" // Added for command parsing
+	"github.com/google/shlex"
 	"gopkg.in/yaml.v3"
 )
+
+// VERSION defines the program version.
+// Future changes should update this according to Semantic Versioning rules.
+const VERSION = "v0.1.0"
 
 // stringSlice is a custom type for accepting multiple string flags
 type stringSlice []string
@@ -29,6 +33,11 @@ func (s *stringSlice) String() string {
 }
 
 func (s *stringSlice) Set(value string) error {
+	// Allow "@" as a command that effectively does nothing but whose error (if any) is ignored.
+	// An empty string after stripping "@" is handled in executeCommand.
+	if value == "" {
+		return fmt.Errorf("hook command cannot be empty (use '@' if a no-op with ignored error is intended)")
+	}
 	*s = append(*s, value)
 	return nil
 }
@@ -45,13 +54,18 @@ type updateRule struct {
 }
 
 func main() {
+	log.Printf("remoteconf version %s starting...", VERSION)
+
 	urlFlag := flag.String("url", "", "Remote config data JSON file URL")
 	var fileFlags stringSlice
 	flag.Var(&fileFlags, "file", "Local config file to update (id=path). Must exist. Can be used multiple times.")
 	var updateFlags stringSlice
 	flag.Var(&updateFlags, "update", "Rules to update local files (<file-id>.<key>=<content-template>). Can be used multiple times.")
-	preCmdFlag := flag.String("pre", "", "Custom command to execute before updates (parsed with shlex).")
-	postCmdFlag := flag.String("post", "", "Custom command to execute after updates (parsed with shlex).")
+
+	var preHookFlags stringSlice
+	flag.Var(&preHookFlags, "pre", "Global pre-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors. Can be used multiple times.")
+	var postHookFlags stringSlice
+	flag.Var(&postHookFlags, "post", "Global post-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors. Can be used multiple times.")
 
 	flag.Parse()
 
@@ -65,23 +79,6 @@ func main() {
 		log.Fatal("Error: at least one 'update' flag is required")
 	}
 
-	// Execute Pre-command
-	if *preCmdFlag != "" {
-		log.Printf("Executing pre-update command: %s", *preCmdFlag)
-		if err := executeCommand(*preCmdFlag); err != nil {
-			log.Fatalf("Error executing pre-update command '%s': %v. Aborting.", *preCmdFlag, err)
-		}
-		log.Println("Pre-update command executed successfully.")
-	}
-
-	// 1. Fetch remote config data
-	remoteConfig, err := fetchRemoteConfig(*urlFlag)
-	if err != nil {
-		log.Fatalf("Error fetching remote config from %s: %v", *urlFlag, err)
-	}
-	log.Printf("Successfully fetched remote config from %s", *urlFlag)
-
-	// 2. Parse file flags
 	localFiles := make(fileMap)
 	for _, f := range fileFlags {
 		parts := strings.SplitN(f, "=", 2)
@@ -92,7 +89,30 @@ func main() {
 		log.Printf("Registered local file: ID='%s', Path='%s'", parts[0], parts[1])
 	}
 
-	// 3. Parse update rules
+	globalPreHooks, filePreHooks := parseHookFlags(preHookFlags, localFiles, "pre-hook")
+	globalPostHooks, filePostHooks := parseHookFlags(postHookFlags, localFiles, "post-hook")
+
+	if len(globalPreHooks) > 0 {
+		log.Println("Executing global pre-update hooks...")
+		for _, cmdStr := range globalPreHooks {
+			runErr, ignoreCmdError := executeCommand(cmdStr, "Global pre-hook")
+			if runErr != nil {
+				if ignoreCmdError {
+					log.Printf("Warning: Global pre-hook '%s' failed but error was ignored as requested: %v", cmdStr, runErr)
+				} else {
+					log.Fatalf("Error executing global pre-hook '%s': %v. Aborting.", cmdStr, runErr)
+				}
+			}
+		}
+		log.Println("Global pre-update hooks executed successfully.")
+	}
+
+	remoteConfig, err := fetchRemoteConfig(*urlFlag)
+	if err != nil {
+		log.Fatalf("Error fetching remote config from %s: %v", *urlFlag, err)
+	}
+	log.Printf("Successfully fetched remote config from %s", *urlFlag)
+
 	var rules []updateRule
 	for _, u := range updateFlags {
 		parts := strings.SplitN(u, "=", 2)
@@ -107,56 +127,105 @@ func main() {
 		if _, ok := localFiles[fileID]; !ok {
 			log.Fatalf("Error: file ID '%s' in update rule '%s' not defined in 'file' flags", fileID, u)
 		}
-
 		tmpl, err := template.New(parts[0]).Parse(parts[1])
 		if err != nil {
 			log.Fatalf("Error parsing template for rule '%s': %v", u, err)
 		}
 		rules = append(rules, updateRule{
-			FileID:     fileID,
-			Path:       keyParts[1:],
-			Template:   tmpl,
-			RawContent: parts[1],
+			FileID: fileID, Path: keyParts[1:], Template: tmpl, RawContent: parts[1],
 		})
-		log.Printf("Registered update rule: FileID='%s', Path='%s', Template='%s'", fileID, strings.Join(keyParts[1:], "."), parts[1])
 	}
 
-	// 4. Process each local file
 	for fileID, filePath := range localFiles {
 		log.Printf("Processing file: ID='%s', Path='%s'", fileID, filePath)
-		err := processFile(fileID, filePath, remoteConfig, rules)
+		err := processFile(fileID, filePath, remoteConfig, rules, filePreHooks[fileID], filePostHooks[fileID])
 		if err != nil {
-			log.Printf("Error processing file %s: %v", filePath, err)
-			// Continue to next file even if one fails
+			log.Printf("Error processing file %s (ID: %s): %v", filePath, fileID, err)
 		}
 	}
 
-	// Execute Post-command
-	if *postCmdFlag != "" {
-		log.Printf("Executing post-update command: %s", *postCmdFlag)
-		if err := executeCommand(*postCmdFlag); err != nil {
-			log.Printf("Warning: Error executing post-update command '%s': %v", *postCmdFlag, err)
-			// Do not abort for post-command failure, just log it.
-		} else {
-			log.Println("Post-update command executed successfully.")
+	if len(globalPostHooks) > 0 {
+		log.Println("Executing global post-update hooks...")
+		for _, cmdStr := range globalPostHooks {
+			runErr, ignoreCmdError := executeCommand(cmdStr, "Global post-hook")
+			if runErr != nil {
+				if ignoreCmdError {
+					log.Printf("Note: Global post-hook '%s' failed but error was ignored as requested: %v", cmdStr, runErr)
+				} else {
+					log.Printf("Warning: Error executing global post-hook '%s': %v", cmdStr, runErr)
+				}
+			}
 		}
+		log.Println("Global post-update hooks executed successfully.")
 	}
 
-	log.Println("remoteconf execution finished.")
+	log.Printf("remoteconf version %s execution finished.", VERSION)
 }
 
-func executeCommand(commandStr string) error {
-	log.Printf("Shell-parsing command string: %s", commandStr)
-	parts, err := shlex.Split(commandStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse command string '%s': %w", commandStr, err)
+func parseHookFlags(hookFlags []string, localFiles fileMap, hookTypeForLog string) (globalHooks []string, fileHooks map[string][]string) {
+	fileHooks = make(map[string][]string)
+	for _, hookCmdFull := range hookFlags {
+		parts := strings.SplitN(hookCmdFull, "=", 2)
+		commandPart := hookCmdFull // Default to full string for global or if malformed
+		isFileSpecific := false
+		var fileID string
+
+		if len(parts) == 2 {
+			potentialFileID := parts[0]
+			// Check if potentialFileID is indeed a registered file ID
+			if _, ok := localFiles[potentialFileID]; ok {
+				// Also ensure it's not an empty fileID like "=cmd" or "@=cmd"
+				if potentialFileID != "" && !(strings.HasPrefix(potentialFileID, "@") && strings.TrimPrefix(potentialFileID, "@") == "") {
+					fileID = potentialFileID
+					commandPart = parts[1] // The actual command line
+					isFileSpecific = true
+				}
+			}
+		}
+
+		actualCommand := commandPart
+		// Check for empty command *after* stripping potential fileID and @
+		cleanedCommandForEmptyCheck := actualCommand
+		if strings.HasPrefix(cleanedCommandForEmptyCheck, "@") {
+			cleanedCommandForEmptyCheck = strings.TrimPrefix(cleanedCommandForEmptyCheck, "@")
+		}
+		if cleanedCommandForEmptyCheck == "" {
+			log.Fatalf("Error: empty command line for %s '%s' (after parsing fileID and/or '@')", hookTypeForLog, hookCmdFull)
+		}
+
+		if isFileSpecific {
+			fileHooks[fileID] = append(fileHooks[fileID], actualCommand) // Store command with '@' if present
+			log.Printf("Registered file-specific %s for ID '%s': %s", hookTypeForLog, fileID, actualCommand)
+		} else {
+			globalHooks = append(globalHooks, hookCmdFull) // Store full command with '@' if present
+			log.Printf("Registered global %s: %s", hookTypeForLog, hookCmdFull)
+		}
+	}
+	return
+}
+
+func executeCommand(rawCommandStr string, hookDesc string) (err error, ignoreError bool) {
+	commandToExecute := rawCommandStr
+	if strings.HasPrefix(rawCommandStr, "@") {
+		ignoreError = true
+		commandToExecute = strings.TrimPrefix(rawCommandStr, "@")
+		// No log here, caller can log if error occurs + is ignored
 	}
 
-	if len(parts) == 0 {
-		// This case should ideally be prevented by the check `if *CmdFlag != ""` in main,
-		// but shlex.Split on an empty or whitespace-only string might also result in empty parts.
-		log.Println("Parsed command string resulted in no executable command (empty or whitespace). Skipping execution.")
-		return nil // Or return an error if an empty command string flag should be an error
+	if commandToExecute == "" {
+		log.Printf("Note: %s '%s' resulted in an empty command after stripping '@'. Skipping execution.", hookDesc, rawCommandStr)
+		return nil, ignoreError // Nothing to run
+	}
+
+	log.Printf("Shell-parsing %s string: %s", hookDesc, commandToExecute)
+	parts, shlexErr := shlex.Split(commandToExecute)
+	if shlexErr != nil {
+		return fmt.Errorf("failed to parse command string for %s ('%s'): %w", hookDesc, commandToExecute, shlexErr), ignoreError
+	}
+
+	if len(parts) == 0 { // Should be caught by commandToExecute == "" if shlex.Split("") is nil
+		log.Printf("Parsed %s string '%s' resulted in no executable command. Skipping.", hookDesc, commandToExecute)
+		return nil, ignoreError
 	}
 
 	commandName := parts[0]
@@ -165,15 +234,21 @@ func executeCommand(commandStr string) error {
 		args = parts[1:]
 	}
 
-	log.Printf("Running command: '%s' with arguments %v", commandName, args)
+	log.Printf("Running %s: '%s' with arguments %v", hookDesc, commandName, args)
 	cmd := exec.Command(commandName, args...)
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	runErr := cmd.Run()
+
+	if runErr != nil && ignoreError {
+		log.Printf("Note: %s '%s' failed but error was ignored as requested: %v", hookDesc, rawCommandStr, runErr)
+	}
+	return runErr, ignoreError
 }
 
 func fetchRemoteConfig(url string) (map[string]interface{}, error) {
+	// ... (same as before)
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch URL: %w", err)
@@ -198,10 +273,10 @@ func fetchRemoteConfig(url string) (map[string]interface{}, error) {
 }
 
 func readFile(filePath string) (map[string]interface{}, []byte, string, error) {
+	// ... (same as before, ensure json.Decoder.UseNumber() is present)
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// File must exist, this is an error condition handled by processFile
 			return nil, nil, "", err
 		}
 		return nil, nil, "", fmt.Errorf("failed to read file %s: %w", filePath, err)
@@ -213,7 +288,7 @@ func readFile(filePath string) (map[string]interface{}, []byte, string, error) {
 	switch ext {
 	case ".json":
 		decoder := json.NewDecoder(bytes.NewReader(content))
-		decoder.UseNumber() // Important for preserving number types accurately
+		decoder.UseNumber()
 		err = decoder.Decode(&data)
 		if err != nil {
 			return nil, content, ext, fmt.Errorf("failed to unmarshal JSON from %s: %w", filePath, err)
@@ -223,11 +298,11 @@ func readFile(filePath string) (map[string]interface{}, []byte, string, error) {
 		if err != nil {
 			return nil, content, ext, fmt.Errorf("failed to unmarshal YAML from %s: %w", filePath, err)
 		}
-		if data == nil { // Ensure data is a map even for empty YAML.
+		if data == nil {
 			data = make(map[string]interface{})
 		}
 	case ".toml":
-		_, err = toml.Decode(string(content), &data) // toml.Unmarshal is an alias
+		_, err = toml.Decode(string(content), &data)
 		if err != nil {
 			return nil, content, ext, fmt.Errorf("failed to unmarshal TOML from %s: %w", filePath, err)
 		}
@@ -238,6 +313,7 @@ func readFile(filePath string) (map[string]interface{}, []byte, string, error) {
 }
 
 func writeFile(filePath string, data map[string]interface{}, format string) error {
+	// ... (same as before)
 	var newContent []byte
 	var err error
 
@@ -261,24 +337,27 @@ func writeFile(filePath string, data map[string]interface{}, format string) erro
 		return fmt.Errorf("failed to marshal data for %s: %w", filePath, err)
 	}
 
-	err = os.WriteFile(filePath, newContent, 0644) // Assume file exists, so dir also exists
+	err = os.WriteFile(filePath, newContent, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to write file %s: %w", filePath, err)
 	}
 	return nil
 }
 
-func processFile(fileID string, filePath string, remoteConfig map[string]interface{}, allRules []updateRule) error {
+func processFile(fileID string, filePath string, remoteConfig map[string]interface{}, allRules []updateRule,
+	preHooksForFile []string, postHooksForFile []string) error {
+
 	localData, originalRawContent, format, err := readFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("Error: Local config file %s (ID: %s) must exist but was not found. Skipping this file.", filePath, fileID)
-			return nil // Not a fatal error for the whole program, but this file is skipped.
+			log.Printf("Error: Local config file %s (ID: %s) must exist but was not found. Skipping this file and its hooks.", filePath, fileID)
+			return nil
 		}
 		return fmt.Errorf("could not read initial state of %s: %w", filePath, err)
 	}
 
-	modifiedData := deepCopyMap(localData) // Work on a copy
+	modifiedData := deepCopyMap(localData)
+	rulesAppliedAndCausedInMemoryChange := false
 
 	fileSpecificRules := []updateRule{}
 	for _, rule := range allRules {
@@ -287,48 +366,47 @@ func processFile(fileID string, filePath string, remoteConfig map[string]interfa
 		}
 	}
 
-	if len(fileSpecificRules) == 0 {
-		log.Printf("No update rules found for file ID '%s'. Skipping modification.", fileID)
-		return nil
+	if len(fileSpecificRules) == 0 && len(preHooksForFile) == 0 && len(postHooksForFile) == 0 {
+		if len(fileSpecificRules) == 0 {
+			log.Printf("No update rules for %s. File content will not change. File-specific hooks will not run.", filePath)
+			return nil
+		}
 	}
 
-	changedOverall := false
 	for _, rule := range fileSpecificRules {
 		currentVal, originalType, found := getNestedValueAndType(modifiedData, rule.Path)
 		if !found {
-			log.Printf("Warning: Path '%s' not found in file %s (ID: %s). Cannot update as field must exist. Skipping this rule.", strings.Join(rule.Path, "."), filePath, fileID)
+			log.Printf("Warning: Path '%s' not found in file %s (ID: %s). Cannot update. Skipping this rule.", strings.Join(rule.Path, "."), filePath, fileID)
 			continue
 		}
-
 		var tplOutput bytes.Buffer
 		if err := rule.Template.Execute(&tplOutput, remoteConfig); err != nil {
-			log.Printf("Warning: Failed to execute template for rule (FileID: %s, Path: %v): %v. Skipping this rule.", rule.FileID, rule.Path, err)
+			log.Printf("Warning: Failed to execute template for rule (FileID: %s, Path: %v): %v. Skipping rule.", rule.FileID, rule.Path, err)
 			continue
 		}
 		newValueStr := tplOutput.String()
-
-		finalValue, err := convertToOriginalType(newValueStr, originalType, rule.Path)
-		if err != nil {
-			log.Printf("Warning: Type conversion failed for path '%s' in file %s (ID: %s): %v. Value from template: '%s'. Expected type similar to original. Skipping this rule.", strings.Join(rule.Path, "."), filePath, fileID, err, newValueStr)
+		finalValue, errConv := convertToOriginalType(newValueStr, originalType, rule.Path)
+		if errConv != nil {
+			log.Printf("Warning: Type conversion for path '%s' in %s (ID: %s) failed: %v. Value: '%s'. Skipping rule.", strings.Join(rule.Path, "."), filePath, fileID, errConv, newValueStr)
 			continue
 		}
-
 		if !reflect.DeepEqual(currentVal, finalValue) {
 			setNestedValue(modifiedData, rule.Path, finalValue)
 			log.Printf("  Applied update to %s: Path='%s', NewValue='%v' (Type: %T)", filePath, strings.Join(rule.Path, "."), finalValue, finalValue)
-			changedOverall = true
+			rulesAppliedAndCausedInMemoryChange = true
 		} else {
 			log.Printf("  Skipped update (no change) for %s: Path='%s', Value='%v'", filePath, strings.Join(rule.Path, "."), finalValue)
 		}
 	}
 
-	if !changedOverall {
-		log.Printf("No effective changes detected for %s. File not modified.", filePath)
+	if !rulesAppliedAndCausedInMemoryChange && len(fileSpecificRules) > 0 { // only skip if rules were present but made no change
+		log.Printf("No in-memory changes for %s based on update rules. File not modified. File-specific hooks will not run.", filePath)
 		return nil
 	}
 
 	var updatedRawContent []byte
 	var marshalErr error
+	// ... (serialization logic remains same)
 	switch format {
 	case ".json":
 		updatedRawContent, marshalErr = json.MarshalIndent(modifiedData, "", "  ")
@@ -352,15 +430,59 @@ func processFile(fileID string, filePath string, remoteConfig map[string]interfa
 	normOriginal := strings.TrimSpace(string(originalRawContent))
 	normUpdated := strings.TrimSpace(string(updatedRawContent))
 
+	// If there were no rules, but there are file-specific hooks,
+	// we still need to check if the file would "change" (it wouldn't if no rules).
+	// The primary condition for hooks is `normOriginal != normUpdated`.
+	// If rulesAppliedAndCausedInMemoryChange is false AND len(fileSpecificRules)==0,
+	// it implies the file cannot change due to this tool, so hooks shouldn't run unless forced by other logic (not the case here).
+	// The current logic: if !rulesApplied... then return. If rulesApplied... then check normOriginal vs normUpdated.
+	// This means if no rules, it returns early. If rules, but no effective change, it returns before hooks.
+	// If rules AND effective change, then hooks run. This is correct.
+
 	if normOriginal == normUpdated {
-		log.Printf("Content for %s is semantically the same after updates, although internal structure might have been marked changed. File not written to avoid format churn.", filePath)
+		log.Printf("Content for %s (ID: %s) is semantically the same after updates. File not written. File-specific hooks will not run.", filePath, fileID)
 		return nil
 	}
 
-	log.Printf("Changes detected for %s. Writing updated file.", filePath)
-	return writeFile(filePath, modifiedData, format)
+	if len(preHooksForFile) > 0 {
+		log.Printf("File content for %s (ID: %s) will change. Executing pre-update hooks...", filePath, fileID)
+		for i, cmdStr := range preHooksForFile {
+			hookDesc := fmt.Sprintf("File-specific pre-hook #%d for ID '%s'", i+1, fileID)
+			runErr, ignoreCmdError := executeCommand(cmdStr, hookDesc)
+			if runErr != nil {
+				if !ignoreCmdError { // Only fail if error is not ignored
+					return fmt.Errorf("%s '%s' failed: %w. Aborting update for this file", hookDesc, cmdStr, runErr)
+				}
+				// If ignoreCmdError is true, the error is already logged by executeCommand
+			}
+		}
+		log.Printf("File-specific pre-hooks for %s (ID: %s) executed successfully (or errors ignored).", filePath, fileID)
+	}
+
+	log.Printf("Writing updated file %s", filePath)
+	if err := writeFile(filePath, modifiedData, format); err != nil {
+		return fmt.Errorf("failed to write updated file %s: %w (post-hooks will not run)", filePath, err)
+	}
+	log.Printf("File %s (ID: %s) successfully updated.", filePath, fileID)
+
+	if len(postHooksForFile) > 0 {
+		log.Printf("Executing post-update hooks for changed file %s (ID: %s)...", filePath, fileID)
+		for i, cmdStr := range postHooksForFile {
+			hookDesc := fmt.Sprintf("File-specific post-hook #%d for ID '%s'", i+1, fileID)
+			runErr, ignoreCmdError := executeCommand(cmdStr, hookDesc)
+			if runErr != nil && !ignoreCmdError { // Log as warning if error is not ignored
+				log.Printf("Warning: %s '%s' failed: %v", hookDesc, cmdStr, runErr)
+			}
+			// If ignoreCmdError is true, error already logged by executeCommand
+		}
+		log.Printf("File-specific post-hooks for %s (ID: %s) executed successfully (or errors ignored).", filePath, fileID)
+	}
+	return nil
 }
 
+// --- Helper functions (convertToOriginalType, setNestedValue, getNestedValueAndType, deepCopyMap, deepCopySlice) ---
+// These remain the same as in the previous version. For brevity, they are not repeated here but should be included.
+// Make sure they are present in your final .go file.
 func convertToOriginalType(newValueStr string, originalType reflect.Type, path []string) (interface{}, error) {
 	if strings.ToLower(newValueStr) == "null" {
 		return nil, nil
