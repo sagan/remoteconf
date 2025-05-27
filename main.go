@@ -18,11 +18,12 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/google/shlex"
+	"gopkg.in/ini.v1" // For INI file support
 	"gopkg.in/yaml.v3"
 )
 
 // VERSION defines the program version.
-const VERSION = "v0.1.1" // Updated version for this change
+const VERSION = "v0.2.1" // Updated version for this fix
 
 // stringSlice is a custom type for accepting multiple string flags
 type stringSlice []string
@@ -30,10 +31,9 @@ type stringSlice []string
 func (s *stringSlice) String() string {
 	return strings.Join(*s, ", ")
 }
-
 func (s *stringSlice) Set(value string) error {
 	if value == "" {
-		return fmt.Errorf("hook command cannot be empty (use '@' if a no-op with ignored error is intended)")
+		return fmt.Errorf("flag value cannot be empty (use '@' for hooks if a no-op with ignored error is intended)")
 	}
 	*s = append(*s, value)
 	return nil
@@ -50,22 +50,27 @@ type updateRule struct {
 	RawContent string
 }
 
+// explicitFileTypesMap stores explicitly set file types by file ID
+var explicitFileTypes map[string]string
+
 func main() {
+	startupMsg := fmt.Sprintf("remoteconf version %s starting...", VERSION)
+
 	urlFlag := flag.String("url", "", "Remote config data JSON file URL")
 	var fileFlags stringSlice
 	flag.Var(&fileFlags, "file", "Local config file to update (id=path). Must exist. Can be used multiple times.")
 	var updateFlags stringSlice
 	flag.Var(&updateFlags, "update", "Rules to update local files (<file-id>.<key>=<content-template>). Can be used multiple times.")
-
 	var preHookFlags stringSlice
-	flag.Var(&preHookFlags, "pre", "Global pre-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors. Can be used multiple times.")
+	flag.Var(&preHookFlags, "pre", "Global pre-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors.")
 	var postHookFlags stringSlice
-	flag.Var(&postHookFlags, "post", "Global post-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors. Can be used multiple times.")
+	flag.Var(&postHookFlags, "post", "Global post-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors.")
 	dryRunFlag := flag.Bool("dry-run", false, "Output config file changes without updating files or running hooks.")
+	var fileTypeFlags stringSlice
+	flag.Var(&fileTypeFlags, "file-type", "Explicitly set file type (<file-id>=<type> e.g., myconf=json). Overrides extension.")
 
 	flag.Parse()
 
-	startupMsg := fmt.Sprintf("remoteconf version %s starting...", VERSION)
 	if *dryRunFlag {
 		startupMsg = fmt.Sprintf("remoteconf version %s starting... DRY-RUN MODE ENABLED", VERSION)
 	}
@@ -91,6 +96,30 @@ func main() {
 		log.Printf("Registered local file: ID='%s', Path='%s'", parts[0], parts[1])
 	}
 
+	explicitFileTypes = make(map[string]string)
+	for _, ft := range fileTypeFlags {
+		parts := strings.SplitN(ft, "=", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			log.Fatalf("Error: invalid 'file-type' flag format: '%s'. Expected 'id=type'", ft)
+		}
+		fileID := parts[0]
+		typeName := strings.ToLower(strings.TrimPrefix(parts[1], "."))
+
+		if _, ok := localFiles[fileID]; !ok {
+			log.Fatalf("Error: file ID '%s' in file-type '%s' not defined in any '-file' flag", fileID, ft)
+		}
+		switch typeName {
+		case "json", "yaml", "yml", "toml", "ini":
+			if typeName == "yml" {
+				typeName = "yaml"
+			} // Normalize
+			explicitFileTypes[fileID] = typeName
+			log.Printf("Registered explicit file type for ID '%s': %s", fileID, typeName)
+		default:
+			log.Fatalf("Error: unsupported file type '%s' specified for file ID '%s' in file-type flag '%s'", parts[1], fileID, ft)
+		}
+	}
+
 	globalPreHooks, filePreHooks := parseHookFlags(preHookFlags, localFiles, "pre-hook")
 	globalPostHooks, filePostHooks := parseHookFlags(postHookFlags, localFiles, "post-hook")
 
@@ -99,8 +128,7 @@ func main() {
 		for _, cmdStr := range globalPreHooks {
 			runErr, ignoreCmdError := executeCommand(cmdStr, "Global pre-hook")
 			if runErr != nil {
-				if ignoreCmdError {
-					log.Printf("Warning: Global pre-hook '%s' failed but error was ignored as requested: %v", cmdStr, runErr)
+				if ignoreCmdError { // Logged by executeCommand
 				} else {
 					log.Fatalf("Error executing global pre-hook '%s': %v. Aborting.", cmdStr, runErr)
 				}
@@ -142,7 +170,14 @@ func main() {
 
 	for fileID, filePath := range localFiles {
 		log.Printf("Processing file: ID='%s', Path='%s'", fileID, filePath)
-		err := processFile(fileID, filePath, remoteConfig, rules, filePreHooks[fileID], filePostHooks[fileID], *dryRunFlag)
+		determinedFormat, formatErr := determineFileFormat(filePath, fileID, explicitFileTypes)
+		if formatErr != nil {
+			log.Printf("Error determining file format for %s (ID: %s): %v. Skipping this file.", filePath, fileID, formatErr)
+			continue
+		}
+		log.Printf("Determined format for %s (ID: %s): %s", filePath, fileID, determinedFormat)
+
+		err := processFile(fileID, filePath, determinedFormat, remoteConfig, rules, filePreHooks[fileID], filePostHooks[fileID], *dryRunFlag)
 		if err != nil {
 			log.Printf("Error processing file %s (ID: %s): %v", filePath, fileID, err)
 		}
@@ -153,8 +188,7 @@ func main() {
 		for _, cmdStr := range globalPostHooks {
 			runErr, ignoreCmdError := executeCommand(cmdStr, "Global post-hook")
 			if runErr != nil {
-				if ignoreCmdError {
-					log.Printf("Note: Global post-hook '%s' failed but error was ignored as requested: %v", cmdStr, runErr)
+				if ignoreCmdError { // Logged by executeCommand
 				} else {
 					log.Printf("Warning: Error executing global post-hook '%s': %v", cmdStr, runErr)
 				}
@@ -166,6 +200,25 @@ func main() {
 	}
 
 	log.Printf("remoteconf version %s execution finished.", VERSION)
+}
+
+func determineFileFormat(filePath string, fileID string, explicitTypes map[string]string) (string, error) {
+	if explicitType, ok := explicitTypes[fileID]; ok { // explicitType is "json", "yaml", "toml", "ini"
+		return explicitType, nil // Already validated and normalized
+	}
+	// Fallback to extension
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(filePath), "."))
+	switch ext {
+	case "json", "yaml", "toml", "ini":
+		return ext, nil
+	case "yml":
+		return "yaml", nil // Normalize yml to yaml
+	default:
+		if ext == "" {
+			return "", fmt.Errorf("file '%s' (ID: %s) has no extension and no explicit type was provided", filePath, fileID)
+		}
+		return "", fmt.Errorf("unsupported file extension '.%s' for file '%s' (ID: %s) and no explicit type provided", ext, filePath, fileID)
+	}
 }
 
 func parseHookFlags(hookFlags []string, localFiles fileMap, hookTypeForLog string) (globalHooks []string, fileHooks map[string][]string) {
@@ -239,14 +292,13 @@ func executeCommand(rawCommandStr string, hookDesc string) (err error, ignoreErr
 	cmd.Stderr = os.Stderr
 	runErr := cmd.Run()
 
-	if runErr != nil && ignoreError { // Log here if error was ignored.
+	if runErr != nil && ignoreError {
 		log.Printf("Note: %s '%s' failed but error was ignored as requested: %v", hookDesc, rawCommandStr, runErr)
 	}
 	return runErr, ignoreError
 }
 
 func fetchRemoteConfig(url string) (map[string]interface{}, error) {
-	// ... (same as before)
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch URL: %w", err)
@@ -270,82 +322,122 @@ func fetchRemoteConfig(url string) (map[string]interface{}, error) {
 	return config, nil
 }
 
-func readFile(filePath string) (map[string]interface{}, []byte, string, error) {
-	// ... (same as before)
-	content, err := os.ReadFile(filePath)
+func readFile(filePath string, format string) (data map[string]interface{}, rawContent []byte, err error) {
+	rawContent, err = os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil, "", err
+			return nil, nil, err
 		}
-		return nil, nil, "", fmt.Errorf("failed to read file %s: %w", filePath, err)
+		return nil, nil, fmt.Errorf("failed to read file %s: %w", filePath, err)
 	}
 
-	var data map[string]interface{}
-	ext := strings.ToLower(filepath.Ext(filePath))
+	data = make(map[string]interface{})
 
-	switch ext {
-	case ".json":
-		decoder := json.NewDecoder(bytes.NewReader(content))
+	switch format {
+	case "json":
+		decoder := json.NewDecoder(bytes.NewReader(rawContent))
 		decoder.UseNumber()
-		err = decoder.Decode(&data)
-		if err != nil {
-			return nil, content, ext, fmt.Errorf("failed to unmarshal JSON from %s: %w", filePath, err)
+		if decErr := decoder.Decode(&data); decErr != nil {
+			return nil, rawContent, fmt.Errorf("failed to unmarshal JSON from %s: %w", filePath, decErr)
 		}
-	case ".yaml", ".yml":
-		err = yaml.Unmarshal(content, &data)
-		if err != nil {
-			return nil, content, ext, fmt.Errorf("failed to unmarshal YAML from %s: %w", filePath, err)
+	case "yaml":
+		if yamlErr := yaml.Unmarshal(rawContent, &data); yamlErr != nil {
+			return nil, rawContent, fmt.Errorf("failed to unmarshal YAML from %s: %w", filePath, yamlErr)
 		}
 		if data == nil {
 			data = make(map[string]interface{})
 		}
-	case ".toml":
-		_, err = toml.Decode(string(content), &data)
-		if err != nil {
-			return nil, content, ext, fmt.Errorf("failed to unmarshal TOML from %s: %w", filePath, err)
+	case "toml":
+		if tomlErr := toml.Unmarshal(rawContent, &data); tomlErr != nil {
+			return nil, rawContent, fmt.Errorf("failed to unmarshal TOML from %s: %w", filePath, tomlErr)
+		}
+	case "ini":
+		iniFile, iniErr := ini.LoadSources(ini.LoadOptions{
+			AllowBooleanKeys: true, // This option helps interpret bare 'key = true' as boolean if needed by Key.Bool() but Key.String() will still give string.
+		}, rawContent)
+		if iniErr != nil {
+			return nil, rawContent, fmt.Errorf("failed to load INI data from %s: %w", filePath, iniErr)
+		}
+		for _, section := range iniFile.Sections() {
+			sectionName := section.Name()
+			if len(section.Keys()) == 0 && sectionName == ini.DEFAULT_SECTION {
+				continue
+			}
+
+			sectionMap := make(map[string]interface{})
+			for _, key := range section.Keys() {
+				sectionMap[key.Name()] = key.String() // Store INI values as strings
+			}
+			// Use the library's defined constant for the default section name for consistency
+			// or map it to an empty string if that's how you want to access it via paths.
+			// For simplicity, storing under its actual name (often "DEFAULT" or what library uses).
+			data[sectionName] = sectionMap
 		}
 	default:
-		return nil, content, ext, fmt.Errorf("unsupported file extension: %s for file %s", ext, filePath)
+		return nil, rawContent, fmt.Errorf("readFile: unsupported format '%s' for file %s", format, filePath)
 	}
-	return data, content, ext, nil
+	return data, rawContent, nil
 }
 
 func writeFile(filePath string, data map[string]interface{}, format string) error {
-	// ... (same as before)
 	var newContent []byte
 	var err error
 
 	switch format {
-	case ".json":
+	case "json":
 		newContent, err = json.MarshalIndent(data, "", "  ")
-	case ".yaml", ".yml":
+	case "yaml":
 		newContent, err = yaml.Marshal(data)
-	case ".toml":
+	case "toml":
 		var buf bytes.Buffer
 		encoder := toml.NewEncoder(&buf)
-		err = encoder.Encode(data)
+		if encErr := encoder.Encode(data); encErr != nil {
+			return fmt.Errorf("failed to marshal TOML for %s: %w", filePath, encErr)
+		}
+		newContent = buf.Bytes()
+	case "ini":
+		iniFile := ini.Empty()
+		for sectionName, sectionUntyped := range data {
+			sectionData, ok := sectionUntyped.(map[string]interface{})
+			if !ok {
+				log.Printf("Warning: converting data to INI for %s: top-level key '%s' is not a section (map[string]interface{}); skipping.", filePath, sectionName)
+				continue
+			}
+
+			var iniSection *ini.Section
+			iniSection, err = iniFile.NewSection(sectionName) // This handles default section if name is "" or ini.DEFAULT_SECTION based on lib.
+			if err != nil {
+				return fmt.Errorf("failed to create INI section '%s' for %s: %w", sectionName, filePath, err)
+			}
+
+			for key, value := range sectionData {
+				_, keyErr := iniSection.NewKey(key, fmt.Sprintf("%v", value))
+				if keyErr != nil {
+					return fmt.Errorf("failed to create INI key '%s' in section '%s' for %s: %w", key, sectionName, filePath, keyErr)
+				}
+			}
+		}
+		var buf bytes.Buffer
+		_, err = iniFile.WriteTo(&buf) // SaveTo writer
 		if err == nil {
 			newContent = buf.Bytes()
 		}
+
 	default:
-		return fmt.Errorf("unsupported file extension for writing: %s", format)
+		return fmt.Errorf("writeFile: unsupported format '%s' for writing", format)
 	}
 
 	if err != nil {
-		return fmt.Errorf("failed to marshal data for %s: %w", filePath, err)
+		return fmt.Errorf("failed to prepare content for %s (format %s): %w", filePath, format, err)
 	}
 
-	err = os.WriteFile(filePath, newContent, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to write file %s: %w", filePath, err)
-	}
-	return nil
+	return os.WriteFile(filePath, newContent, 0644)
 }
 
-func processFile(fileID string, filePath string, remoteConfig map[string]interface{}, allRules []updateRule,
+func processFile(fileID string, filePath string, format string, remoteConfig map[string]interface{}, allRules []updateRule,
 	preHooksForFile []string, postHooksForFile []string, dryRun bool) error {
 
-	localData, originalRawContent, format, err := readFile(filePath)
+	localData, originalRawContent, err := readFile(filePath, format)
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Printf("Error: Local config file %s (ID: %s) must exist but was not found. Skipping.", filePath, fileID)
@@ -364,14 +456,11 @@ func processFile(fileID string, filePath string, remoteConfig map[string]interfa
 		}
 	}
 
-	// If no rules AND no file-specific hooks, and we are not in dry-run (where we might want to see it anyway if it *had* rules)
-	// then we can potentially skip. But for dry-run, we want to see what *would* happen.
-	// The logic below handles this: if no rules cause change, it reports no change.
-
 	for _, rule := range fileSpecificRules {
 		currentVal, originalType, found := getNestedValueAndType(modifiedData, rule.Path)
 		if !found {
-			log.Printf("Warning: Path '%s' not found in file %s (ID: %s). Cannot update. Skipping this rule.", strings.Join(rule.Path, "."), filePath, fileID)
+			// For INI, path might be "SECTION.key" or "DEFAULT.key"
+			log.Printf("Warning: Path '%s' not found in file %s (ID: %s, Format: %s). Cannot update. Skipping this rule.", strings.Join(rule.Path, "."), filePath, fileID, format)
 			continue
 		}
 		var tplOutput bytes.Buffer
@@ -398,31 +487,64 @@ func processFile(fileID string, filePath string, remoteConfig map[string]interfa
 		log.Printf("No in-memory changes for %s (ID: %s) based on update rules. File will not be modified.", filePath, fileID)
 		return nil
 	}
-	if len(fileSpecificRules) == 0 && !dryRun { // No rules, not dry run: nothing to do or show for this file specifically based on rules
-		log.Printf("No update rules for %s (ID: %s). File not modified.", filePath, fileID)
-		return nil
+	if len(fileSpecificRules) == 0 { // No rules to apply for this file
+		log.Printf("No update rules for %s (ID: %s). File content unchanged by rules.", filePath, fileID)
+		// Proceed to comparison; if file is identical (e.g. after manual edit to match what would be), no write/hooks
 	}
 
 	var updatedRawContent []byte
 	var marshalErr error
 	switch format {
-	case ".json":
+	case "json":
 		updatedRawContent, marshalErr = json.MarshalIndent(modifiedData, "", "  ")
-	case ".yaml", ".yml":
+	case "yaml":
 		updatedRawContent, marshalErr = yaml.Marshal(modifiedData)
-	case ".toml":
+	case "toml":
 		var buf bytes.Buffer
 		encoder := toml.NewEncoder(&buf)
 		marshalErr = encoder.Encode(modifiedData)
 		if marshalErr == nil {
 			updatedRawContent = buf.Bytes()
 		}
+	case "ini":
+		iniFile := ini.Empty()
+		for sectionName, sectionUntyped := range modifiedData {
+			sectionData, ok := sectionUntyped.(map[string]interface{})
+			if !ok {
+				log.Printf("Warning: converting data to INI for %s: top-level key '%s' is not a section (map[string]interface{}); skipping.", filePath, sectionName)
+				continue
+			}
+			var iniSection *ini.Section
+			var secCreateErr error
+			iniSection, secCreateErr = iniFile.NewSection(sectionName)
+			if secCreateErr != nil {
+				marshalErr = fmt.Errorf("failed to create INI section '%s': %w", sectionName, secCreateErr)
+				break
+			}
+			for key, value := range sectionData {
+				_, keyErr := iniSection.NewKey(key, fmt.Sprintf("%v", value))
+				if keyErr != nil {
+					marshalErr = fmt.Errorf("failed to create INI key '%s' in section '%s': %w", key, sectionName, keyErr)
+					break
+				}
+			}
+			if marshalErr != nil {
+				break
+			}
+		}
+		if marshalErr == nil {
+			var buf bytes.Buffer
+			_, marshalErr = iniFile.WriteTo(&buf)
+			if marshalErr == nil {
+				updatedRawContent = buf.Bytes()
+			}
+		}
 	default:
-		return fmt.Errorf("internal error: unsupported format for final comparison %s", format)
+		return fmt.Errorf("processFile: unsupported format '%s' for marshalling", format)
 	}
 
 	if marshalErr != nil {
-		return fmt.Errorf("failed to marshal modified data for comparison for %s: %w", filePath, marshalErr)
+		return fmt.Errorf("failed to marshal modified data for %s (format %s): %w", filePath, format, marshalErr)
 	}
 
 	normOriginal := strings.TrimSpace(string(originalRawContent))
@@ -433,20 +555,17 @@ func processFile(fileID string, filePath string, remoteConfig map[string]interfa
 		return nil
 	}
 
-	// --- Change Detected ---
 	if dryRun {
 		log.Printf("DRY-RUN: File %s (ID: %s) would be updated.", filePath, fileID)
-		// Using fmt.Printf for direct output of changes, log for metadata
 		fmt.Printf("\n--- DRY-RUN: Start of changes for %s (ID: %s) ---\n", filePath, fileID)
-		fmt.Print(string(updatedRawContent)) // string() is important here
+		fmt.Print(string(updatedRawContent))
 		fmt.Printf("\n--- DRY-RUN: End of changes for %s (ID: %s) ---\n\n", filePath, fileID)
 		if len(preHooksForFile) > 0 || len(postHooksForFile) > 0 {
 			log.Printf("DRY-RUN: File-specific hooks for %s (ID: %s) would be ignored.", filePath, fileID)
 		}
-		return nil // Successful dry-run for this file
+		return nil
 	}
 
-	// --- Live Run: Execute Hooks and Write File ---
 	if len(preHooksForFile) > 0 {
 		log.Printf("File content for %s (ID: %s) will change. Executing pre-update hooks...", filePath, fileID)
 		for i, cmdStr := range preHooksForFile {
@@ -479,8 +598,6 @@ func processFile(fileID string, filePath string, remoteConfig map[string]interfa
 	return nil
 }
 
-// --- Helper functions (convertToOriginalType, setNestedValue, getNestedValueAndType, deepCopyMap, deepCopySlice) ---
-// These remain the same as in the previous version.
 func convertToOriginalType(newValueStr string, originalType reflect.Type, path []string) (interface{}, error) {
 	if strings.ToLower(newValueStr) == "null" {
 		return nil, nil
@@ -508,6 +625,13 @@ func convertToOriginalType(newValueStr string, originalType reflect.Type, path [
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		iVal, err := strconv.ParseInt(newValueStr, 10, originalType.Bits())
 		if err != nil {
+			if fVal, fErr := strconv.ParseFloat(newValueStr, 64); fErr == nil {
+				if iValFromFloat := int64(fVal); float64(iValFromFloat) == fVal {
+					val := reflect.New(originalType).Elem()
+					val.SetInt(iValFromFloat)
+					return val.Interface(), nil
+				}
+			}
 			return nil, fmt.Errorf("cannot convert '%s' to %s for path %v: %w", newValueStr, originalType.Kind(), path, err)
 		}
 		val := reflect.New(originalType).Elem()
@@ -516,6 +640,13 @@ func convertToOriginalType(newValueStr string, originalType reflect.Type, path [
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		uVal, err := strconv.ParseUint(newValueStr, 10, originalType.Bits())
 		if err != nil {
+			if fVal, fErr := strconv.ParseFloat(newValueStr, 64); fErr == nil && fVal >= 0 {
+				if uValFromFloat := uint64(fVal); float64(uValFromFloat) == fVal {
+					val := reflect.New(originalType).Elem()
+					val.SetUint(uValFromFloat)
+					return val.Interface(), nil
+				}
+			}
 			return nil, fmt.Errorf("cannot convert '%s' to %s for path %v: %w", newValueStr, originalType.Kind(), path, err)
 		}
 		val := reflect.New(originalType).Elem()
@@ -536,11 +667,6 @@ func convertToOriginalType(newValueStr string, originalType reflect.Type, path [
 		}
 		return bVal, nil
 	case reflect.Interface:
-		if num, ok := originalType.MethodByName("Float64"); ok && num.Type.NumIn() == 0 && num.Type.NumOut() == 2 {
-			if fVal, err := strconv.ParseFloat(newValueStr, 64); err == nil {
-				return fVal, nil
-			}
-		}
 		if iVal, err := strconv.ParseInt(newValueStr, 10, 64); err == nil {
 			return iVal, nil
 		}
@@ -552,7 +678,7 @@ func convertToOriginalType(newValueStr string, originalType reflect.Type, path [
 		}
 		return newValueStr, nil
 	default:
-		return nil, fmt.Errorf("unsupported type %s for automatic conversion at path %v. Value: '%s'", originalType.Kind(), path, newValueStr)
+		return nil, fmt.Errorf("unsupported original type %s for automatic conversion at path %v. Value from template: '%s'", originalType.Kind(), path, newValueStr)
 	}
 }
 
@@ -563,11 +689,16 @@ func setNestedValue(data map[string]interface{}, path []string, value interface{
 			current[key] = value
 			return
 		}
+		if _, ok := current[key]; !ok {
+			current[key] = make(map[string]interface{})
+		}
 		if nextMap, ok := current[key].(map[string]interface{}); ok {
 			current = nextMap
 		} else {
-			log.Printf("Error: Path segment '%s' in '%s' is not a map, cannot set nested value.", key, strings.Join(path, "."))
-			return
+			log.Printf("Warning: Overwriting non-map value at path segment '%s' to set nested key '%s'", strings.Join(path[:i+1], "."), strings.Join(path, "."))
+			newMap := make(map[string]interface{})
+			current[key] = newMap
+			current = newMap
 		}
 	}
 }
@@ -588,7 +719,7 @@ func getNestedValueAndType(data map[string]interface{}, path []string) (value in
 			return current, reflect.TypeOf(current), true
 		}
 	}
-	if len(path) == 0 {
+	if len(path) == 0 && data != nil {
 		return data, reflect.TypeOf(data), true
 	}
 	return nil, nil, false

@@ -71,3 +71,28 @@ By Gemini 2.5 Pro AI.
 > 2.  Add a VERSION constant which define the version number of the program. Set it to "v0.1.0". Print the program verison when program started. The future changes to program codes should update the VERSION constant according to Semantic Versioning rules.
 
 > Add a optional "dry-run" boolean flag, which makes the program only output config file changes without actually updating them. The hooks are also ignored in this mode.
+
+> Make the follow changes:
+>
+> - Add optional "file-type" flag, which uses `<file-id>=<type>` syntax. The flag can be used to explicitly set the config file type (json / toml / yaml /...).
+> - Support .ini file type. Use https://pkg.go.dev/gopkg.in/ini.v1 , https://pkg.go.dev/github.com/go-ini/ini or similar package.
+
+## Flags
+
+```
+Usage of remoteconf:
+  -dry-run
+        Output config file changes without updating files or running hooks.
+  -file value
+        Local config file to update (id=path). Must exist. Can be used multiple times.
+  -file-type value
+        Explicitly set file type (<file-id>=<type> e.g., myconf=json). Overrides extension.
+  -post value
+        Global post-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors.
+  -pre value
+        Global pre-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors.
+  -update value
+        Rules to update local files (<file-id>.<key>=<content-template>). Can be used multiple times.
+  -url string
+        Remote config data JSON file URL
+```
