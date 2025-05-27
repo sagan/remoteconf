@@ -69,3 +69,5 @@ By Gemini 2.5 Pro AI.
 >
 > 1.  If a cmdline of pre / post hooks has a leading "@" char, ignore any error when executing it.
 > 2.  Add a VERSION constant which define the version number of the program. Set it to "v0.1.0". Print the program verison when program started. The future changes to program codes should update the VERSION constant according to Semantic Versioning rules.
+
+> Add a optional "dry-run" boolean flag, which makes the program only output config file changes without actually updating them. The hooks are also ignored in this mode.
