@@ -23,7 +23,7 @@ import (
 )
 
 // VERSION defines the program version.
-const VERSION = "v0.2.1" // Updated version for this fix
+const VERSION = "v0.2.2" // Updated version for this fix
 
 // stringSlice is a custom type for accepting multiple string flags
 type stringSlice []string
@@ -457,9 +457,8 @@ func processFile(fileID string, filePath string, format string, remoteConfig map
 	}
 
 	for _, rule := range fileSpecificRules {
-		currentVal, originalType, found := getNestedValueAndType(modifiedData, rule.Path)
+		currentVal, _, found := getNestedValueAndType(modifiedData, rule.Path) // originalType is no longer directly used here
 		if !found {
-			// For INI, path might be "SECTION.key" or "DEFAULT.key"
 			log.Printf("Warning: Path '%s' not found in file %s (ID: %s, Format: %s). Cannot update. Skipping this rule.", strings.Join(rule.Path, "."), filePath, fileID, format)
 			continue
 		}
@@ -469,9 +468,9 @@ func processFile(fileID string, filePath string, format string, remoteConfig map
 			continue
 		}
 		newValueStr := tplOutput.String()
-		finalValue, errConv := convertToOriginalType(newValueStr, originalType, rule.Path)
+		finalValue, errConv := convertToOriginalType(newValueStr, currentVal, rule.Path) // Pass currentVal
 		if errConv != nil {
-			log.Printf("Warning: Type conversion for path '%s' in %s (ID: %s) failed: %v. Value: '%s'. Skipping rule.", strings.Join(rule.Path, "."), filePath, fileID, errConv, newValueStr)
+			log.Printf("Warning: Type conversion for path '%s' in %s (ID: %s) failed: %v. Value from template: '%s'. Skipping rule.", strings.Join(rule.Path, "."), filePath, fileID, errConv, newValueStr)
 			continue
 		}
 		if !reflect.DeepEqual(currentVal, finalValue) {
@@ -598,12 +597,16 @@ func processFile(fileID string, filePath string, format string, remoteConfig map
 	return nil
 }
 
-func convertToOriginalType(newValueStr string, originalType reflect.Type, path []string) (interface{}, error) {
+var jsonNumberType = reflect.TypeOf(json.Number("")) // Used for specific json.Number handling
+
+// convertToOriginalType attempts to convert the newValueStr to match the type of originalVal.
+// If originalVal is nil, it infers the type for newValueStr.
+func convertToOriginalType(newValueStr string, originalVal interface{}, path []string) (interface{}, error) {
 	if strings.ToLower(newValueStr) == "null" {
-		return nil, nil
+		return nil, nil // Allow setting to null
 	}
 
-	if originalType == nil {
+	if originalVal == nil { // Original value was nil (e.g., JSON null), infer type for new value
 		if iVal, err := strconv.ParseInt(newValueStr, 10, 64); err == nil {
 			return iVal, nil
 		} else if fVal, err := strconv.ParseFloat(newValueStr, 64); err == nil {
@@ -616,23 +619,51 @@ func convertToOriginalType(newValueStr string, originalType reflect.Type, path [
 				return unquoted, nil
 			}
 		}
-		return newValueStr, nil
+		return newValueStr, nil // Fallback to string
 	}
 
+	originalType := reflect.TypeOf(originalVal)
+
+	// Special handling for json.Number to preserve/convert to numeric type
+	if originalType == jsonNumberType {
+		// Try to parse newValueStr as Int64 or Float64
+		// If original json.Number could be an int, and newValueStr is int, prefer int.
+		// Otherwise, if newValueStr is float, use float.
+		if iVal, err := strconv.ParseInt(newValueStr, 10, 64); err == nil {
+			// Check if the new value exactly represents an integer (e.g., "23", not "23.0" if we want strict int)
+			// However, ParseInt handles "23" correctly.
+			// If original was, say, json.Number("22.0"), this will still make it int64(22) if newValueStr is "22".
+			// This is generally fine as it becomes a concrete number.
+			return iVal, nil
+		}
+		if fVal, err := strconv.ParseFloat(newValueStr, 64); err == nil {
+			return fVal, nil
+		}
+		// If newValueStr from template is not a valid number string, but original was json.Number
+		return nil, fmt.Errorf("value '%s' from template is not a valid number format for original numeric field at path %v", newValueStr, path)
+	}
+
+	// Fallback to Kind checks for other types
 	switch originalType.Kind() {
-	case reflect.String:
+	case reflect.String: // For actual strings (not json.Number which has Kind string)
 		return newValueStr, nil
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		iVal, err := strconv.ParseInt(newValueStr, 10, originalType.Bits())
 		if err != nil {
+			// Attempt float to int conversion if original was int but template might produce float string e.g. "22.0"
 			if fVal, fErr := strconv.ParseFloat(newValueStr, 64); fErr == nil {
-				if iValFromFloat := int64(fVal); float64(iValFromFloat) == fVal {
+				// Ensure no loss of precision if converting float to int
+				iValFromFloat := int64(fVal)
+				if val := reflect.New(originalType).Elem(); val.OverflowInt(iValFromFloat) { // Check for overflow for specific int type
+					return nil, fmt.Errorf("value '%s' (parsed as float %f, int %d) overflows original integer type %s for path %v", newValueStr, fVal, iValFromFloat, originalType.Kind(), path)
+				}
+				if float64(iValFromFloat) == fVal { // Check if conversion is exact
 					val := reflect.New(originalType).Elem()
 					val.SetInt(iValFromFloat)
 					return val.Interface(), nil
 				}
 			}
-			return nil, fmt.Errorf("cannot convert '%s' to %s for path %v: %w", newValueStr, originalType.Kind(), path, err)
+			return nil, fmt.Errorf("cannot convert '%s' to original integer type %s for path %v: %w", newValueStr, originalType.Kind(), path, err)
 		}
 		val := reflect.New(originalType).Elem()
 		val.SetInt(iVal)
@@ -641,13 +672,17 @@ func convertToOriginalType(newValueStr string, originalType reflect.Type, path [
 		uVal, err := strconv.ParseUint(newValueStr, 10, originalType.Bits())
 		if err != nil {
 			if fVal, fErr := strconv.ParseFloat(newValueStr, 64); fErr == nil && fVal >= 0 {
-				if uValFromFloat := uint64(fVal); float64(uValFromFloat) == fVal {
+				uValFromFloat := uint64(fVal)
+				if val := reflect.New(originalType).Elem(); val.OverflowUint(uValFromFloat) {
+					return nil, fmt.Errorf("value '%s' (parsed as float %f, uint %d) overflows original unsigned integer type %s for path %v", newValueStr, fVal, uValFromFloat, originalType.Kind(), path)
+				}
+				if float64(uValFromFloat) == fVal {
 					val := reflect.New(originalType).Elem()
 					val.SetUint(uValFromFloat)
 					return val.Interface(), nil
 				}
 			}
-			return nil, fmt.Errorf("cannot convert '%s' to %s for path %v: %w", newValueStr, originalType.Kind(), path, err)
+			return nil, fmt.Errorf("cannot convert '%s' to original unsigned integer type %s for path %v: %w", newValueStr, originalType.Kind(), path, err)
 		}
 		val := reflect.New(originalType).Elem()
 		val.SetUint(uVal)
@@ -655,7 +690,7 @@ func convertToOriginalType(newValueStr string, originalType reflect.Type, path [
 	case reflect.Float32, reflect.Float64:
 		fVal, err := strconv.ParseFloat(newValueStr, originalType.Bits())
 		if err != nil {
-			return nil, fmt.Errorf("cannot convert '%s' to %s for path %v: %w", newValueStr, originalType.Kind(), path, err)
+			return nil, fmt.Errorf("cannot convert '%s' to original float type %s for path %v: %w", newValueStr, originalType.Kind(), path, err)
 		}
 		val := reflect.New(originalType).Elem()
 		val.SetFloat(fVal)
@@ -666,7 +701,9 @@ func convertToOriginalType(newValueStr string, originalType reflect.Type, path [
 			return nil, fmt.Errorf("cannot convert '%s' to bool for path %v: %w", newValueStr, path, err)
 		}
 		return bVal, nil
-	case reflect.Interface:
+	case reflect.Interface: // Original value was interface{} (e.g. from a map not strictly typed by JSON like json.Number)
+		// This case might be hit if the original value's concrete type wasn't a primitive one
+		// but was stored in an interface{}. We'll try to infer a common type.
 		if iVal, err := strconv.ParseInt(newValueStr, 10, 64); err == nil {
 			return iVal, nil
 		}
@@ -676,7 +713,9 @@ func convertToOriginalType(newValueStr string, originalType reflect.Type, path [
 		if bVal, err := strconv.ParseBool(newValueStr); err == nil {
 			return bVal, nil
 		}
+		// If it's an interface, and none of the above, keep it as string from template
 		return newValueStr, nil
+
 	default:
 		return nil, fmt.Errorf("unsupported original type %s for automatic conversion at path %v. Value from template: '%s'", originalType.Kind(), path, newValueStr)
 	}

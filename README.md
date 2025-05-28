@@ -2,6 +2,13 @@
 
 By Gemini 2.5 Pro AI.
 
+- [remoteconf](#remoteconf)
+  - [Prompt](#prompt)
+    - [Initial prompt](#initial-prompt)
+    - [Follow-up prompts](#follow-up-prompts)
+    - [v0.2.2](#v022)
+  - [Flags](#flags)
+
 ## Prompt
 
 ### Initial prompt
@@ -76,6 +83,12 @@ By Gemini 2.5 Pro AI.
 >
 > - Add optional "file-type" flag, which uses `<file-id>=<type>` syntax. The flag can be used to explicitly set the config file type (json / toml / yaml /...).
 > - Support .ini file type. Use https://pkg.go.dev/gopkg.in/ini.v1 , https://pkg.go.dev/github.com/go-ini/ini or similar package.
+
+### v0.2.2
+
+```
+I found a bug that the updated value in config file doesn't follow it's previous type. E.g. if the current "server_port" value is 22 (number), the new value (Go text template render result) is "23", it will update the config file field to "23" (string). But I want the new value to be 23 (number)
+```
 
 ## Flags
 
