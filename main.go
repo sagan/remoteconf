@@ -2,10 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/csv" // Added for robust CSV parsing
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
+	"io" // For io.EOF with csv.Reader
 	"log"
 	"net/http"
 	"os"
@@ -18,14 +19,14 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/google/shlex"
-	"gopkg.in/ini.v1" // For INI file support
+	"gopkg.in/ini.v1"
 	"gopkg.in/yaml.v3"
 )
 
 // VERSION defines the program version.
-const VERSION = "v0.2.2" // Updated version for this fix
+const VERSION = "v0.3.1" // CSV parsing improvement
 
-// stringSlice is a custom type for accepting multiple string flags
+// stringSlice ... (definition remains the same)
 type stringSlice []string
 
 func (s *stringSlice) String() string {
@@ -39,10 +40,10 @@ func (s *stringSlice) Set(value string) error {
 	return nil
 }
 
-// fileMap stores file ID and its path
+// fileMap ... (definition remains the same)
 type fileMap map[string]string
 
-// updateRule defines how to update a local config file
+// updateRule ... (definition remains the same)
 type updateRule struct {
 	FileID     string
 	Path       []string
@@ -50,47 +51,164 @@ type updateRule struct {
 	RawContent string
 }
 
-// explicitFileTypesMap stores explicitly set file types by file ID
+// explicitFileTypesMap ... (definition remains the same)
 var explicitFileTypes map[string]string
 
-func main() {
-	startupMsg := fmt.Sprintf("remoteconf version %s starting...", VERSION)
+func isFlagPassed(name string) bool {
+	// ... (same as v0.3.0)
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
 
-	urlFlag := flag.String("url", "", "Remote config data JSON file URL")
+// parseCSVString uses encoding/csv to parse a single line CSV string.
+// It trims whitespace from each resulting field and filters out empty fields.
+func parseCSVString(csvString string) ([]string, error) {
+	if csvString == "" {
+		return nil, nil
+	}
+
+	r := csv.NewReader(strings.NewReader(csvString))
+	// We expect a single line of CSV data.
+	fields, err := r.Read()
+	if err != nil {
+		// io.EOF is expected if the string is empty before any valid record.
+		// Since we check csvString != "" above, an EOF here for a non-empty string
+		// means it was likely just whitespace or comments (if reader configured for them).
+		// For a single record, EOF is not returned by Read() itself, but by subsequent calls.
+		// A parsing error is more relevant here if fields are not extracted.
+		if err == io.EOF { // If csvString was perhaps only whitespace that reader consumed.
+			return nil, nil
+		}
+		return nil, fmt.Errorf("parsing CSV string: %w", err)
+	}
+
+	// Trim whitespace and filter out empty strings, similar to previous simpler logic.
+	// This ensures that `a,,b` or `a, " ", b` results in `["a", "b"]`.
+	// A quoted empty string `""` will become an empty string, then filtered.
+	result := make([]string, 0, len(fields))
+	for _, field := range fields {
+		trimmed := strings.TrimSpace(field)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result, nil
+}
+
+func main() {
+	// Define flags (same as v0.3.0)
+	urlFlag := flag.String("url", "", "Remote config data JSON file URL (Env: REMOTECONF_URL)")
+	dryRunFlag := flag.Bool("dry-run", false, "Output config file changes without updating files or running hooks (Env: REMOTECONF_DRY_RUN)")
+
 	var fileFlags stringSlice
-	flag.Var(&fileFlags, "file", "Local config file to update (id=path). Must exist. Can be used multiple times.")
+	flag.Var(&fileFlags, "file", "Local config file to update (id=path). Must exist. (Env: REMOTECONF_FILE as CSV). Can be used multiple times.")
 	var updateFlags stringSlice
-	flag.Var(&updateFlags, "update", "Rules to update local files (<file-id>.<key>=<content-template>). Can be used multiple times.")
+	flag.Var(&updateFlags, "update", "Rules to update local files (<file-id>.<key>=<content-template>). (Env: REMOTECONF_UPDATE as CSV). Can be used multiple times.")
 	var preHookFlags stringSlice
-	flag.Var(&preHookFlags, "pre", "Global pre-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors.")
+	flag.Var(&preHookFlags, "pre", "Global pre-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors. (Env: REMOTECONF_PRE as CSV). Can be used multiple times.")
 	var postHookFlags stringSlice
-	flag.Var(&postHookFlags, "post", "Global post-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors.")
-	dryRunFlag := flag.Bool("dry-run", false, "Output config file changes without updating files or running hooks.")
+	flag.Var(&postHookFlags, "post", "Global post-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors. (Env: REMOTECONF_POST as CSV). Can be used multiple times.")
 	var fileTypeFlags stringSlice
-	flag.Var(&fileTypeFlags, "file-type", "Explicitly set file type (<file-id>=<type> e.g., myconf=json). Overrides extension.")
+	flag.Var(&fileTypeFlags, "file-type", "Explicitly set file type (<file-id>=<type> e.g., myconf=json). Overrides extension. (Env: REMOTECONF_FILE_TYPE as CSV). Can be used multiple times.")
 
 	flag.Parse()
 
+	// Handle environment variables (same logic structure as v0.3.0, but calls new parseCSVString)
+	if !isFlagPassed("url") {
+		envVal := os.Getenv("REMOTECONF_URL")
+		if envVal != "" {
+			*urlFlag = envVal
+			log.Printf("Using URL from environment variable REMOTECONF_URL")
+		}
+	}
+
+	if !isFlagPassed("dry-run") {
+		envVal := os.Getenv("REMOTECONF_DRY_RUN")
+		if envVal != "" {
+			valLower := strings.ToLower(envVal)
+			if valLower == "0" || valLower == "false" {
+				*dryRunFlag = false
+			} else {
+				*dryRunFlag = true
+			}
+			log.Printf("Using dry-run setting from environment variable REMOTECONF_DRY_RUN: %v", *dryRunFlag)
+		}
+	}
+
+	// Updated handling for stringSlice flags using new parseCSVString
+	if envFiles := os.Getenv("REMOTECONF_FILE"); envFiles != "" {
+		parts, err := parseCSVString(envFiles)
+		if err != nil {
+			log.Printf("Warning: Could not parse REMOTECONF_FILE as CSV ('%s'): %v. Skipping these values.", envFiles, err)
+		} else if len(parts) > 0 {
+			fileFlags = append(fileFlags, parts...)
+			log.Printf("Added %d file entries from REMOTECONF_FILE", len(parts))
+		}
+	}
+	if envUpdates := os.Getenv("REMOTECONF_UPDATE"); envUpdates != "" {
+		parts, err := parseCSVString(envUpdates)
+		if err != nil {
+			log.Printf("Warning: Could not parse REMOTECONF_UPDATE as CSV ('%s'): %v. Skipping these values.", envUpdates, err)
+		} else if len(parts) > 0 {
+			updateFlags = append(updateFlags, parts...)
+			log.Printf("Added %d update rule entries from REMOTECONF_UPDATE", len(parts))
+		}
+	}
+	if envPreHooks := os.Getenv("REMOTECONF_PRE"); envPreHooks != "" {
+		parts, err := parseCSVString(envPreHooks)
+		if err != nil {
+			log.Printf("Warning: Could not parse REMOTECONF_PRE as CSV ('%s'): %v. Skipping these values.", envPreHooks, err)
+		} else if len(parts) > 0 {
+			preHookFlags = append(preHookFlags, parts...)
+			log.Printf("Added %d pre-hook entries from REMOTECONF_PRE", len(parts))
+		}
+	}
+	if envPostHooks := os.Getenv("REMOTECONF_POST"); envPostHooks != "" {
+		parts, err := parseCSVString(envPostHooks)
+		if err != nil {
+			log.Printf("Warning: Could not parse REMOTECONF_POST as CSV ('%s'): %v. Skipping these values.", envPostHooks, err)
+		} else if len(parts) > 0 {
+			postHookFlags = append(postHookFlags, parts...)
+			log.Printf("Added %d post-hook entries from REMOTECONF_POST", len(parts))
+		}
+	}
+	if envFileTypes := os.Getenv("REMOTECONF_FILE_TYPE"); envFileTypes != "" {
+		parts, err := parseCSVString(envFileTypes)
+		if err != nil {
+			log.Printf("Warning: Could not parse REMOTECONF_FILE_TYPE as CSV ('%s'): %v. Skipping these values.", envFileTypes, err)
+		} else if len(parts) > 0 {
+			fileTypeFlags = append(fileTypeFlags, parts...)
+			log.Printf("Added %d file-type entries from REMOTECONF_FILE_TYPE", len(parts))
+		}
+	}
+
+	startupMsg := fmt.Sprintf("remoteconf version %s starting...", VERSION)
 	if *dryRunFlag {
 		startupMsg = fmt.Sprintf("remoteconf version %s starting... DRY-RUN MODE ENABLED", VERSION)
 	}
 	log.Println(startupMsg)
 
 	if *urlFlag == "" {
-		log.Fatal("Error: 'url' flag is required")
+		log.Fatal("Error: 'url' is required (either via -url flag or REMOTECONF_URL environment variable)")
 	}
 	if len(fileFlags) == 0 {
-		log.Fatal("Error: at least one 'file' flag is required")
+		log.Fatal("Error: at least one 'file' is required (either via -file flag or REMOTECONF_FILE environment variable)")
 	}
 	if len(updateFlags) == 0 {
-		log.Fatal("Error: at least one 'update' flag is required")
+		log.Fatal("Error: at least one 'update' rule is required (either via -update flag or REMOTECONF_UPDATE environment variable)")
 	}
 
+	// ---- Main Program Logic (largely same as v0.3.0 / v0.2.2) ----
 	localFiles := make(fileMap)
 	for _, f := range fileFlags {
 		parts := strings.SplitN(f, "=", 2)
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			log.Fatalf("Error: invalid 'file' flag format: %s. Expected 'id=path'", f)
+			log.Fatalf("Error: invalid 'file' entry format: '%s'. Expected 'id=path'", f)
 		}
 		localFiles[parts[0]] = parts[1]
 		log.Printf("Registered local file: ID='%s', Path='%s'", parts[0], parts[1])
@@ -100,23 +218,23 @@ func main() {
 	for _, ft := range fileTypeFlags {
 		parts := strings.SplitN(ft, "=", 2)
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			log.Fatalf("Error: invalid 'file-type' flag format: '%s'. Expected 'id=type'", ft)
+			log.Fatalf("Error: invalid 'file-type' entry format: '%s'. Expected 'id=type'", ft)
 		}
 		fileID := parts[0]
 		typeName := strings.ToLower(strings.TrimPrefix(parts[1], "."))
 
 		if _, ok := localFiles[fileID]; !ok {
-			log.Fatalf("Error: file ID '%s' in file-type '%s' not defined in any '-file' flag", fileID, ft)
+			log.Fatalf("Error: file ID '%s' in file-type '%s' not defined in any '-file' entry", fileID, ft)
 		}
 		switch typeName {
 		case "json", "yaml", "yml", "toml", "ini":
 			if typeName == "yml" {
 				typeName = "yaml"
-			} // Normalize
+			}
 			explicitFileTypes[fileID] = typeName
 			log.Printf("Registered explicit file type for ID '%s': %s", fileID, typeName)
 		default:
-			log.Fatalf("Error: unsupported file type '%s' specified for file ID '%s' in file-type flag '%s'", parts[1], fileID, ft)
+			log.Fatalf("Error: unsupported file type '%s' specified for file ID '%s' in file-type entry '%s'", parts[1], fileID, ft)
 		}
 	}
 
@@ -128,8 +246,7 @@ func main() {
 		for _, cmdStr := range globalPreHooks {
 			runErr, ignoreCmdError := executeCommand(cmdStr, "Global pre-hook")
 			if runErr != nil {
-				if ignoreCmdError { // Logged by executeCommand
-				} else {
+				if !ignoreCmdError {
 					log.Fatalf("Error executing global pre-hook '%s': %v. Aborting.", cmdStr, runErr)
 				}
 			}
@@ -149,15 +266,15 @@ func main() {
 	for _, u := range updateFlags {
 		parts := strings.SplitN(u, "=", 2)
 		if len(parts) != 2 || parts[0] == "" {
-			log.Fatalf("Error: invalid 'update' flag format: %s. Expected '<file-id>.<key>=<content-template>'", u)
+			log.Fatalf("Error: invalid 'update' rule format: '%s'. Expected '<file-id>.<key>=<content-template>'", u)
 		}
 		keyParts := strings.Split(parts[0], ".")
 		if len(keyParts) < 2 {
-			log.Fatalf("Error: invalid key in 'update' flag: %s. Expected '<file-id>.<key.subkey...>'", parts[0])
+			log.Fatalf("Error: invalid key in 'update' rule: '%s'. Expected '<file-id>.<key.subkey...>'", parts[0])
 		}
 		fileID := keyParts[0]
 		if _, ok := localFiles[fileID]; !ok {
-			log.Fatalf("Error: file ID '%s' in update rule '%s' not defined in 'file' flags", fileID, u)
+			log.Fatalf("Error: file ID '%s' in update rule '%s' not defined in any '-file' entry", fileID, u)
 		}
 		tmpl, err := template.New(parts[0]).Parse(parts[1])
 		if err != nil {
@@ -188,8 +305,7 @@ func main() {
 		for _, cmdStr := range globalPostHooks {
 			runErr, ignoreCmdError := executeCommand(cmdStr, "Global post-hook")
 			if runErr != nil {
-				if ignoreCmdError { // Logged by executeCommand
-				} else {
+				if !ignoreCmdError {
 					log.Printf("Warning: Error executing global post-hook '%s': %v", cmdStr, runErr)
 				}
 			}
@@ -202,17 +318,18 @@ func main() {
 	log.Printf("remoteconf version %s execution finished.", VERSION)
 }
 
+// --- determineFileFormat, parseHookFlags, executeCommand, fetchRemoteConfig ---
+// These functions remain the same as v0.3.0 / v0.2.2
 func determineFileFormat(filePath string, fileID string, explicitTypes map[string]string) (string, error) {
-	if explicitType, ok := explicitTypes[fileID]; ok { // explicitType is "json", "yaml", "toml", "ini"
-		return explicitType, nil // Already validated and normalized
+	if explicitType, ok := explicitTypes[fileID]; ok {
+		return explicitType, nil
 	}
-	// Fallback to extension
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(filePath), "."))
 	switch ext {
 	case "json", "yaml", "toml", "ini":
 		return ext, nil
 	case "yml":
-		return "yaml", nil // Normalize yml to yaml
+		return "yaml", nil
 	default:
 		if ext == "" {
 			return "", fmt.Errorf("file '%s' (ID: %s) has no extension and no explicit type was provided", filePath, fileID)
@@ -322,6 +439,14 @@ func fetchRemoteConfig(url string) (map[string]interface{}, error) {
 	return config, nil
 }
 
+var jsonNumberType = reflect.TypeOf(json.Number(""))
+
+// --- readFile, writeFile, processFile, convertToOriginalType, and other helpers ---
+// These core logic functions remain largely the same as v0.2.2 (with INI support and type fixes)
+// Ensure you have the correct versions of these from the previous iterations.
+// For brevity, I will only show the modified sections of readFile, writeFile, processFile and convertToOriginalType
+// from version 0.2.2 (which includes the ini.LoadOptions fix and correct convertToOriginalType for json.Number)
+
 func readFile(filePath string, format string) (data map[string]interface{}, rawContent []byte, err error) {
 	rawContent, err = os.ReadFile(filePath)
 	if err != nil {
@@ -353,24 +478,21 @@ func readFile(filePath string, format string) (data map[string]interface{}, rawC
 		}
 	case "ini":
 		iniFile, iniErr := ini.LoadSources(ini.LoadOptions{
-			AllowBooleanKeys: true, // This option helps interpret bare 'key = true' as boolean if needed by Key.Bool() but Key.String() will still give string.
+			AllowBooleanKeys: true, // Corrected: removed LooseQuotes
 		}, rawContent)
 		if iniErr != nil {
 			return nil, rawContent, fmt.Errorf("failed to load INI data from %s: %w", filePath, iniErr)
 		}
 		for _, section := range iniFile.Sections() {
 			sectionName := section.Name()
-			if len(section.Keys()) == 0 && sectionName == ini.DEFAULT_SECTION {
+			if sectionName == ini.DEFAULT_SECTION && len(section.Keys()) == 0 {
 				continue
 			}
 
 			sectionMap := make(map[string]interface{})
 			for _, key := range section.Keys() {
-				sectionMap[key.Name()] = key.String() // Store INI values as strings
+				sectionMap[key.Name()] = key.String()
 			}
-			// Use the library's defined constant for the default section name for consistency
-			// or map it to an empty string if that's how you want to access it via paths.
-			// For simplicity, storing under its actual name (often "DEFAULT" or what library uses).
 			data[sectionName] = sectionMap
 		}
 	default:
@@ -405,7 +527,7 @@ func writeFile(filePath string, data map[string]interface{}, format string) erro
 			}
 
 			var iniSection *ini.Section
-			iniSection, err = iniFile.NewSection(sectionName) // This handles default section if name is "" or ini.DEFAULT_SECTION based on lib.
+			iniSection, err = iniFile.NewSection(sectionName)
 			if err != nil {
 				return fmt.Errorf("failed to create INI section '%s' for %s: %w", sectionName, filePath, err)
 			}
@@ -418,7 +540,7 @@ func writeFile(filePath string, data map[string]interface{}, format string) erro
 			}
 		}
 		var buf bytes.Buffer
-		_, err = iniFile.WriteTo(&buf) // SaveTo writer
+		_, err = iniFile.WriteTo(&buf)
 		if err == nil {
 			newContent = buf.Bytes()
 		}
@@ -436,7 +558,6 @@ func writeFile(filePath string, data map[string]interface{}, format string) erro
 
 func processFile(fileID string, filePath string, format string, remoteConfig map[string]interface{}, allRules []updateRule,
 	preHooksForFile []string, postHooksForFile []string, dryRun bool) error {
-
 	localData, originalRawContent, err := readFile(filePath, format)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -457,7 +578,7 @@ func processFile(fileID string, filePath string, format string, remoteConfig map
 	}
 
 	for _, rule := range fileSpecificRules {
-		currentVal, _, found := getNestedValueAndType(modifiedData, rule.Path) // originalType is no longer directly used here
+		currentVal, _, found := getNestedValueAndType(modifiedData, rule.Path)
 		if !found {
 			log.Printf("Warning: Path '%s' not found in file %s (ID: %s, Format: %s). Cannot update. Skipping this rule.", strings.Join(rule.Path, "."), filePath, fileID, format)
 			continue
@@ -468,7 +589,7 @@ func processFile(fileID string, filePath string, format string, remoteConfig map
 			continue
 		}
 		newValueStr := tplOutput.String()
-		finalValue, errConv := convertToOriginalType(newValueStr, currentVal, rule.Path) // Pass currentVal
+		finalValue, errConv := convertToOriginalType(newValueStr, currentVal, rule.Path)
 		if errConv != nil {
 			log.Printf("Warning: Type conversion for path '%s' in %s (ID: %s) failed: %v. Value from template: '%s'. Skipping rule.", strings.Join(rule.Path, "."), filePath, fileID, errConv, newValueStr)
 			continue
@@ -486,9 +607,8 @@ func processFile(fileID string, filePath string, format string, remoteConfig map
 		log.Printf("No in-memory changes for %s (ID: %s) based on update rules. File will not be modified.", filePath, fileID)
 		return nil
 	}
-	if len(fileSpecificRules) == 0 { // No rules to apply for this file
+	if len(fileSpecificRules) == 0 {
 		log.Printf("No update rules for %s (ID: %s). File content unchanged by rules.", filePath, fileID)
-		// Proceed to comparison; if file is identical (e.g. after manual edit to match what would be), no write/hooks
 	}
 
 	var updatedRawContent []byte
@@ -597,16 +717,12 @@ func processFile(fileID string, filePath string, format string, remoteConfig map
 	return nil
 }
 
-var jsonNumberType = reflect.TypeOf(json.Number("")) // Used for specific json.Number handling
-
-// convertToOriginalType attempts to convert the newValueStr to match the type of originalVal.
-// If originalVal is nil, it infers the type for newValueStr.
 func convertToOriginalType(newValueStr string, originalVal interface{}, path []string) (interface{}, error) {
 	if strings.ToLower(newValueStr) == "null" {
-		return nil, nil // Allow setting to null
+		return nil, nil
 	}
 
-	if originalVal == nil { // Original value was nil (e.g., JSON null), infer type for new value
+	if originalVal == nil {
 		if iVal, err := strconv.ParseInt(newValueStr, 10, 64); err == nil {
 			return iVal, nil
 		} else if fVal, err := strconv.ParseFloat(newValueStr, 64); err == nil {
@@ -619,45 +735,33 @@ func convertToOriginalType(newValueStr string, originalVal interface{}, path []s
 				return unquoted, nil
 			}
 		}
-		return newValueStr, nil // Fallback to string
+		return newValueStr, nil
 	}
 
 	originalType := reflect.TypeOf(originalVal)
 
-	// Special handling for json.Number to preserve/convert to numeric type
 	if originalType == jsonNumberType {
-		// Try to parse newValueStr as Int64 or Float64
-		// If original json.Number could be an int, and newValueStr is int, prefer int.
-		// Otherwise, if newValueStr is float, use float.
 		if iVal, err := strconv.ParseInt(newValueStr, 10, 64); err == nil {
-			// Check if the new value exactly represents an integer (e.g., "23", not "23.0" if we want strict int)
-			// However, ParseInt handles "23" correctly.
-			// If original was, say, json.Number("22.0"), this will still make it int64(22) if newValueStr is "22".
-			// This is generally fine as it becomes a concrete number.
 			return iVal, nil
 		}
 		if fVal, err := strconv.ParseFloat(newValueStr, 64); err == nil {
 			return fVal, nil
 		}
-		// If newValueStr from template is not a valid number string, but original was json.Number
 		return nil, fmt.Errorf("value '%s' from template is not a valid number format for original numeric field at path %v", newValueStr, path)
 	}
 
-	// Fallback to Kind checks for other types
 	switch originalType.Kind() {
-	case reflect.String: // For actual strings (not json.Number which has Kind string)
+	case reflect.String:
 		return newValueStr, nil
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		iVal, err := strconv.ParseInt(newValueStr, 10, originalType.Bits())
 		if err != nil {
-			// Attempt float to int conversion if original was int but template might produce float string e.g. "22.0"
 			if fVal, fErr := strconv.ParseFloat(newValueStr, 64); fErr == nil {
-				// Ensure no loss of precision if converting float to int
 				iValFromFloat := int64(fVal)
-				if val := reflect.New(originalType).Elem(); val.OverflowInt(iValFromFloat) { // Check for overflow for specific int type
+				if val := reflect.New(originalType).Elem(); val.OverflowInt(iValFromFloat) {
 					return nil, fmt.Errorf("value '%s' (parsed as float %f, int %d) overflows original integer type %s for path %v", newValueStr, fVal, iValFromFloat, originalType.Kind(), path)
 				}
-				if float64(iValFromFloat) == fVal { // Check if conversion is exact
+				if float64(iValFromFloat) == fVal {
 					val := reflect.New(originalType).Elem()
 					val.SetInt(iValFromFloat)
 					return val.Interface(), nil
@@ -701,9 +805,7 @@ func convertToOriginalType(newValueStr string, originalVal interface{}, path []s
 			return nil, fmt.Errorf("cannot convert '%s' to bool for path %v: %w", newValueStr, path, err)
 		}
 		return bVal, nil
-	case reflect.Interface: // Original value was interface{} (e.g. from a map not strictly typed by JSON like json.Number)
-		// This case might be hit if the original value's concrete type wasn't a primitive one
-		// but was stored in an interface{}. We'll try to infer a common type.
+	case reflect.Interface:
 		if iVal, err := strconv.ParseInt(newValueStr, 10, 64); err == nil {
 			return iVal, nil
 		}
@@ -713,9 +815,7 @@ func convertToOriginalType(newValueStr string, originalVal interface{}, path []s
 		if bVal, err := strconv.ParseBool(newValueStr); err == nil {
 			return bVal, nil
 		}
-		// If it's an interface, and none of the above, keep it as string from template
 		return newValueStr, nil
-
 	default:
 		return nil, fmt.Errorf("unsupported original type %s for automatic conversion at path %v. Value from template: '%s'", originalType.Kind(), path, newValueStr)
 	}

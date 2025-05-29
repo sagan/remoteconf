@@ -7,6 +7,7 @@ By Gemini 2.5 Pro AI.
     - [Initial prompt](#initial-prompt)
     - [Follow-up prompts](#follow-up-prompts)
     - [v0.2.2](#v022)
+    - [v0.3.1](#v031)
   - [Flags](#flags)
 
 ## Prompt
@@ -90,22 +91,39 @@ By Gemini 2.5 Pro AI.
 I found a bug that the updated value in config file doesn't follow it's previous type. E.g. if the current "server_port" value is 22 (number), the new value (Go text template render result) is "23", it will update the config file field to "23" (string). But I want the new value to be 23 (number)
 ```
 
+### v0.3.1
+
+```
+Improve the program to make it be able to read all options from environment variables.
+Prefix env variable names with "REMOTECONF".
+E.g. the "file-type" flag can be set via "REMOTECONF_FILE_TYPE" env variable.
+For flags of stringSlice type, the env variable value is treated as a CSV string.
+For flags of boolean type, any non-empty environment variable value, except "0" and "false", is treated as true.
+
+For stringSlice options, if both cmdling flags and environment variables are defined, all values will be used.
+For other type option, cmdline flags take precedence over environment variables.
+```
+
+```
+Use "encoding/csv" package to parse csv value instead of just strings.Split(csvString, ",") , which doesn't handle escaping / quoting at all.
+```
+
 ## Flags
 
 ```
 Usage of remoteconf:
   -dry-run
-        Output config file changes without updating files or running hooks.
+        Output config file changes without updating files or running hooks (Env: REMOTECONF_DRY_RUN)
   -file value
-        Local config file to update (id=path). Must exist. Can be used multiple times.
+        Local config file to update (id=path). Must exist. (Env: REMOTECONF_FILE as CSV). Can be used multiple times.
   -file-type value
-        Explicitly set file type (<file-id>=<type> e.g., myconf=json). Overrides extension.
+        Explicitly set file type (<file-id>=<type> e.g., myconf=json). Overrides extension. (Env: REMOTECONF_FILE_TYPE as CSV). Can be used multiple times.
   -post value
-        Global post-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors.
+        Global post-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors. (Env: REMOTECONF_POST as CSV). Can be used multiple times.
   -pre value
-        Global pre-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors.
+        Global pre-update command or <file-id>=<cmd>. Prefix with '@' to ignore errors. (Env: REMOTECONF_PRE as CSV). Can be used multiple times.
   -update value
-        Rules to update local files (<file-id>.<key>=<content-template>). Can be used multiple times.
+        Rules to update local files (<file-id>.<key>=<content-template>). (Env: REMOTECONF_UPDATE as CSV). Can be used multiple times.
   -url string
-        Remote config data JSON file URL
+        Remote config data JSON file URL (Env: REMOTECONF_URL)
 ```
