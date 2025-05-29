@@ -8,6 +8,7 @@ By Gemini 2.5 Pro AI.
     - [Follow-up prompts](#follow-up-prompts)
     - [v0.2.2](#v022)
     - [v0.3.1](#v031)
+    - [v0.3.2](#v032)
   - [Flags](#flags)
 
 ## Prompt
@@ -106,6 +107,12 @@ For other type option, cmdline flags take precedence over environment variables.
 
 ```
 Use "encoding/csv" package to parse csv value instead of just strings.Split(csvString, ",") , which doesn't handle escaping / quoting at all.
+```
+
+### v0.3.2
+
+```
+Integrate sprig ( https://github.com/Masterminds/sprig ) library to the program. It is a functions library for Go text template.
 ```
 
 ## Flags

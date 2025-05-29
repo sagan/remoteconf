@@ -2,11 +2,11 @@ package main
 
 import (
 	"bytes"
-	"encoding/csv" // Added for robust CSV parsing
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io" // For io.EOF with csv.Reader
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -15,16 +15,17 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"text/template"
+	"text/template" // Standard Go text/template package
 
 	"github.com/BurntSushi/toml"
+	"github.com/Masterminds/sprig/v3" // Added for Sprig template functions
 	"github.com/google/shlex"
 	"gopkg.in/ini.v1"
 	"gopkg.in/yaml.v3"
 )
 
 // VERSION defines the program version.
-const VERSION = "v0.3.1" // CSV parsing improvement
+const VERSION = "v0.4.0" // New feature: Sprig template functions
 
 // stringSlice ... (definition remains the same)
 type stringSlice []string
@@ -55,7 +56,7 @@ type updateRule struct {
 var explicitFileTypes map[string]string
 
 func isFlagPassed(name string) bool {
-	// ... (same as v0.3.0)
+	// ... (same as v0.3.1)
 	found := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == name {
@@ -65,31 +66,20 @@ func isFlagPassed(name string) bool {
 	return found
 }
 
-// parseCSVString uses encoding/csv to parse a single line CSV string.
-// It trims whitespace from each resulting field and filters out empty fields.
 func parseCSVString(csvString string) ([]string, error) {
+	// ... (same as v0.3.1)
 	if csvString == "" {
 		return nil, nil
 	}
 
 	r := csv.NewReader(strings.NewReader(csvString))
-	// We expect a single line of CSV data.
 	fields, err := r.Read()
 	if err != nil {
-		// io.EOF is expected if the string is empty before any valid record.
-		// Since we check csvString != "" above, an EOF here for a non-empty string
-		// means it was likely just whitespace or comments (if reader configured for them).
-		// For a single record, EOF is not returned by Read() itself, but by subsequent calls.
-		// A parsing error is more relevant here if fields are not extracted.
-		if err == io.EOF { // If csvString was perhaps only whitespace that reader consumed.
+		if err == io.EOF {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("parsing CSV string: %w", err)
 	}
-
-	// Trim whitespace and filter out empty strings, similar to previous simpler logic.
-	// This ensures that `a,,b` or `a, " ", b` results in `["a", "b"]`.
-	// A quoted empty string `""` will become an empty string, then filtered.
 	result := make([]string, 0, len(fields))
 	for _, field := range fields {
 		trimmed := strings.TrimSpace(field)
@@ -101,7 +91,7 @@ func parseCSVString(csvString string) ([]string, error) {
 }
 
 func main() {
-	// Define flags (same as v0.3.0)
+	// Define flags (same as v0.3.1)
 	urlFlag := flag.String("url", "", "Remote config data JSON file URL (Env: REMOTECONF_URL)")
 	dryRunFlag := flag.Bool("dry-run", false, "Output config file changes without updating files or running hooks (Env: REMOTECONF_DRY_RUN)")
 
@@ -118,7 +108,7 @@ func main() {
 
 	flag.Parse()
 
-	// Handle environment variables (same logic structure as v0.3.0, but calls new parseCSVString)
+	// Handle environment variables (same logic structure as v0.3.1)
 	if !isFlagPassed("url") {
 		envVal := os.Getenv("REMOTECONF_URL")
 		if envVal != "" {
@@ -140,7 +130,6 @@ func main() {
 		}
 	}
 
-	// Updated handling for stringSlice flags using new parseCSVString
 	if envFiles := os.Getenv("REMOTECONF_FILE"); envFiles != "" {
 		parts, err := parseCSVString(envFiles)
 		if err != nil {
@@ -203,7 +192,6 @@ func main() {
 		log.Fatal("Error: at least one 'update' rule is required (either via -update flag or REMOTECONF_UPDATE environment variable)")
 	}
 
-	// ---- Main Program Logic (largely same as v0.3.0 / v0.2.2) ----
 	localFiles := make(fileMap)
 	for _, f := range fileFlags {
 		parts := strings.SplitN(f, "=", 2)
@@ -276,10 +264,14 @@ func main() {
 		if _, ok := localFiles[fileID]; !ok {
 			log.Fatalf("Error: file ID '%s' in update rule '%s' not defined in any '-file' entry", fileID, u)
 		}
-		tmpl, err := template.New(parts[0]).Parse(parts[1])
+
+		// ** MODIFIED SECTION for Sprig functions **
+		tmpl, err := template.New(parts[0]).Funcs(sprig.TxtFuncMap()).Parse(parts[1])
 		if err != nil {
-			log.Fatalf("Error parsing template for rule '%s': %v", u, err)
+			log.Fatalf("Error parsing template (with Sprig) for rule '%s': %v", u, err)
 		}
+		// ** END MODIFIED SECTION **
+
 		rules = append(rules, updateRule{
 			FileID: fileID, Path: keyParts[1:], Template: tmpl, RawContent: parts[1],
 		})
@@ -319,7 +311,11 @@ func main() {
 }
 
 // --- determineFileFormat, parseHookFlags, executeCommand, fetchRemoteConfig ---
-// These functions remain the same as v0.3.0 / v0.2.2
+// --- readFile, writeFile, processFile, convertToOriginalType, and other helpers ---
+// These functions remain the same as v0.3.1 / v0.2.2.
+// Ensure you have the correct versions of these from the previous iterations.
+// For brevity, they are not repeated here but are essential for the program to function.
+
 func determineFileFormat(filePath string, fileID string, explicitTypes map[string]string) (string, error) {
 	if explicitType, ok := explicitTypes[fileID]; ok {
 		return explicitType, nil
@@ -441,12 +437,6 @@ func fetchRemoteConfig(url string) (map[string]interface{}, error) {
 
 var jsonNumberType = reflect.TypeOf(json.Number(""))
 
-// --- readFile, writeFile, processFile, convertToOriginalType, and other helpers ---
-// These core logic functions remain largely the same as v0.2.2 (with INI support and type fixes)
-// Ensure you have the correct versions of these from the previous iterations.
-// For brevity, I will only show the modified sections of readFile, writeFile, processFile and convertToOriginalType
-// from version 0.2.2 (which includes the ini.LoadOptions fix and correct convertToOriginalType for json.Number)
-
 func readFile(filePath string, format string) (data map[string]interface{}, rawContent []byte, err error) {
 	rawContent, err = os.ReadFile(filePath)
 	if err != nil {
@@ -478,7 +468,7 @@ func readFile(filePath string, format string) (data map[string]interface{}, rawC
 		}
 	case "ini":
 		iniFile, iniErr := ini.LoadSources(ini.LoadOptions{
-			AllowBooleanKeys: true, // Corrected: removed LooseQuotes
+			AllowBooleanKeys: true,
 		}, rawContent)
 		if iniErr != nil {
 			return nil, rawContent, fmt.Errorf("failed to load INI data from %s: %w", filePath, iniErr)
